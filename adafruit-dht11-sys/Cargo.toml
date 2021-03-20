@@ -1,0 +1,11 @@
+[package]
+name = "adafruit-dht11-sys"
+version = "0.1.0"
+authors = ["nnub"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+bindgen = "0.57"
+cc = { version = "1.0", features = ["parallel"] }

@@ -1,0 +1,4 @@
+{
+    "rust-analyzer.checkOnSave.command": "clippy --target=arm-unknown-linux-gnueabi",
+    "rust-analyzer.cargo.target": "arm-unknown-linux-gnueabi"
+}

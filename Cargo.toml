@@ -1,5 +1,9 @@
 [workspace]
 
 members = [
-    "diotd"
+    "diot-core",
+    "diotd",
+    "dht11-test",
+    "adafruit-dht11-sys",
+    "vendor/libp2p-mdns"
 ]

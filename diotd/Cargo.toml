@@ -7,16 +7,28 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+diot-core = { path = "../diot-core" }
 anyhow = "1.0"
 tokio-compat-02 = "0.2"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.2"
 tracing-futures = "0.2"
+bincode = "1"
+serde_json = "1"
+sled = "0.34"
+zerocopy = "0.3"
+byteorder = "1"
+lazy_static = "1"
+rand = "0.8"
 
 [dependencies.tokio]
 version = "1.0"
 features = ["full"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
 
 [dependencies.libp2p]
 version = "0.35"
@@ -24,10 +36,10 @@ default-features = false
 features = [
     "deflate",
     "dns",
+    "gossipsub",
     "floodsub",
     "identify",
     "kad",
-    "mdns",
     "mplex",
     "noise",
     "ping",
@@ -39,3 +51,6 @@ features = [
     "uds",
     "yamux"
 ]
+
+[dependencies.libp2p-mdns]
+path = "../vendor/libp2p-mdns"
