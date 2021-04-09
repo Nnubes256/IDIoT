@@ -1,4 +1,6 @@
 {
-    "rust-analyzer.checkOnSave.command": "clippy --target=arm-unknown-linux-gnueabi",
-    "rust-analyzer.cargo.target": "arm-unknown-linux-gnueabi"
+//    "rust-analyzer.cargo.target": "arm-unknown-linux-gnueabi",
+//    "rust-analyzer.checkOnSave.command": "",
+//    "rust-analyzer.checkOnSave.enable": false,
+//    "rust-analyzer.checkOnSave.overrideCommand": ["cross", "clippy", "--target=arm-unknown-linux-gnueabi", "--message-format=json"]
 }

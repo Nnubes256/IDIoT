@@ -1,45 +1,278 @@
-use std::{fmt::Debug, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use async_bincode::{AsyncBincodeReader, AsyncBincodeWriter};
+use async_compat::CompatExt;
+use diot_core::device::ActuationResult;
+use futures::{sink::SinkExt, stream::StreamExt};
 
-use crate::store::PeerStore;
+use crate::{
+    hardware::{FullActuatorData, FullSensorData},
+    store::RemotePeerDevice,
+    system::{LocalPeerData, PeerSecrets},
+};
 use serde::{Deserialize, Serialize};
 
 use libp2p::{
-    core::transport::Boxed as BoxedTransport,
+    core::{transport::Boxed as BoxedTransport, ProtocolName},
     gossipsub::{
-        Gossipsub, GossipsubConfigBuilder, GossipsubEvent, IdentTopic, MessageAuthenticity,
-        ValidationMode,
+        error::PublishError, Gossipsub, GossipsubConfigBuilder, GossipsubEvent, IdentTopic,
+        MessageAuthenticity, ValidationMode,
     },
     identity::{ed25519::Keypair as Ed25519Keypair, Keypair},
     ping::{Ping, PingConfig, PingEvent},
     pnet::{PnetConfig, PreSharedKey},
     swarm::{
-        ExpandedSwarm, IntoProtocolsHandler, NetworkBehaviour, NetworkBehaviourEventProcess,
-        ProtocolsHandler, SwarmBuilder,
+        ExpandedSwarm, IntoProtocolsHandler, NetworkBehaviour, NetworkBehaviourAction,
+        NetworkBehaviourEventProcess, PollParameters, ProtocolsHandler, SwarmBuilder,
     },
     NetworkBehaviour, PeerId, Transport,
 };
 use libp2p_mdns::{Mdns, MdnsEvent};
+use libp2p_request_response::{
+    RequestId, RequestResponse, RequestResponseCodec, RequestResponseConfig, RequestResponseEvent,
+    RequestResponseMessage, ResponseChannel,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerData {
     pub(crate) name: String,
+    pub(crate) devices: HashMap<String, RemotePeerDevice>,
+}
+
+impl From<LocalPeerData> for PeerData {
+    fn from(lpd: LocalPeerData) -> Self {
+        let mut devices_2 = HashMap::with_capacity(lpd.devices.len());
+        for (name, dev) in lpd.devices {
+            devices_2.insert(name, dev.into());
+        }
+        PeerData {
+            name: lpd.name,
+            devices: devices_2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DiotdBroadcast {
     Identity(PeerData),
+    SensorData(FullSensorData),
+}
+
+#[derive(Debug)]
+pub struct ReceivedBroadcast {
+    pub sender: PeerId,
+    pub broadcast_type: DiotdBroadcast,
+}
+
+#[derive(Debug)]
+pub enum SwarmOutEvent {
+    Broadcast(ReceivedBroadcast),
+    ActuatorRequest {
+        data: FullActuatorData,
+        channel: ResponseChannel<RemoteActuationResponse>,
+    },
+    ActuatorResponse {
+        id: RequestId,
+        response: ActuationResult,
+    },
+}
+
+// HACK: `bincode` can't serialize `serde` tagged enums; thus, we need a different type
+// from it that we can then cast to `AcutationResult`
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RemoteActuationResponse {
+    Success,
+    Ignored,
+    NoResponse,
+    BadRequest {
+        reason: String,
+    },
+    ActuatorError {
+        error_code: i64,
+        error_description: String,
+    },
+}
+
+impl From<RemoteActuationResponse> for ActuationResult {
+    fn from(remote: RemoteActuationResponse) -> Self {
+        use RemoteActuationResponse::{ActuatorError, BadRequest, Ignored, NoResponse, Success};
+
+        match remote {
+            Success => Self::Success,
+            Ignored => Self::Ignored,
+            NoResponse => Self::NoResponse,
+            BadRequest { reason } => Self::BadRequest { reason },
+            ActuatorError {
+                error_code,
+                error_description,
+            } => Self::ActuatorError {
+                error_code,
+                error_description,
+            },
+        }
+    }
+}
+
+impl From<ActuationResult> for RemoteActuationResponse {
+    fn from(remote: ActuationResult) -> Self {
+        use ActuationResult::{ActuatorError, BadRequest, Ignored, NoResponse, Success};
+
+        match remote {
+            Success => Self::Success,
+            Ignored => Self::Ignored,
+            NoResponse => Self::NoResponse,
+            BadRequest { reason } => Self::BadRequest { reason },
+            ActuatorError {
+                error_code,
+                error_description,
+            } => Self::ActuatorError {
+                error_code,
+                error_description,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ActuatorRequestProtocol {
+    V1,
+}
+
+impl ProtocolName for ActuatorRequestProtocol {
+    fn protocol_name(&self) -> &[u8] {
+        match *self {
+            ActuatorRequestProtocol::V1 => b"/diodt/actuators/1.0",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ActuatorRequestsCodec;
+
+#[async_trait]
+impl RequestResponseCodec for ActuatorRequestsCodec {
+    type Protocol = ActuatorRequestProtocol;
+    type Request = FullActuatorData;
+    type Response = RemoteActuationResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Request>
+    where
+        T: futures::AsyncRead + Unpin + Send,
+    {
+        let mut deserializer = AsyncBincodeReader::from(io.compat());
+        match deserializer.next().await {
+            Some(item) => match item {
+                Ok(item) => Ok(item),
+                Err(err) => {
+                    error!("Error while deserializing GossipSub request: {}", err);
+                    match *err {
+                        bincode::ErrorKind::Io(err) => Err(err),
+                        err => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                    }
+                }
+            },
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                anyhow!("Got None from request"),
+            )),
+        }
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Response>
+    where
+        T: futures::AsyncRead + Unpin + Send,
+    {
+        let mut deserializer = AsyncBincodeReader::from(io.compat());
+        match deserializer.next().await {
+            Some(item) => match item {
+                Ok(item) => Ok(item),
+                Err(err) => {
+                    error!("Error while deserializing GossipSub response: {}", err);
+                    match *err {
+                        bincode::ErrorKind::Io(err) => Err(err),
+                        err => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                    }
+                }
+            },
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                anyhow!("Got None from request"),
+            )),
+        }
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> std::io::Result<()>
+    where
+        T: futures::AsyncWrite + Unpin + Send,
+    {
+        let mut serializer = AsyncBincodeWriter::from(io.compat()).for_async();
+        match serializer.send(req).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                error!("Error while serializing GossipSub request: {}", err);
+                match *err {
+                    bincode::ErrorKind::Io(err) => Err(err),
+                    err => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                }
+            }
+        }
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> std::io::Result<()>
+    where
+        T: futures::AsyncWrite + Unpin + Send,
+    {
+        let mut serializer = AsyncBincodeWriter::from(io.compat()).for_async();
+        match serializer.send(res).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                error!("Error while serializing GossipSub response: {}", err);
+                match *err {
+                    bincode::ErrorKind::Io(err) => Err(err),
+                    err => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                }
+            }
+        }
+    }
 }
 
 /// Network behavior for use with libp2p for each node
 #[derive(NetworkBehaviour)]
+#[behaviour(out_event = "SwarmOutEvent", poll_method = "poll")]
 pub struct DiotdBehavior {
     ping: Ping,
     mdns: Mdns,
     pub(crate) gossipsub: Gossipsub,
+    actuator_requests: RequestResponse<ActuatorRequestsCodec>,
     #[behaviour(ignore)]
-    peer_store: PeerStore,
+    local_peer_id: PeerId,
+    #[behaviour(ignore)]
+    out_ev: VecDeque<SwarmOutEvent>,
 }
 
 impl Debug for DiotdBehavior {
@@ -51,10 +284,7 @@ impl Debug for DiotdBehavior {
 }
 
 impl DiotdBehavior {
-    pub async fn new(local_peer_id: PeerId, db: &sled::Db, keypair: Keypair) -> Result<Self> {
-        let peer_store =
-            PeerStore::new(db, local_peer_id).context("Couldn't initialize peer store")?;
-
+    pub async fn new(local_peer_id: PeerId, keypair: Keypair) -> Result<Self> {
         let mdns = Mdns::with_service_name(b"_p2p-nodes-nope._udp.local".to_vec())
             .await
             .context("Couldn't initialize mDNS")?;
@@ -69,16 +299,100 @@ impl DiotdBehavior {
 
         let ping = Ping::new(PingConfig::new().with_keep_alive(true));
 
+        let actuator_requests = RequestResponse::new(
+            ActuatorRequestsCodec,
+            std::iter::once((
+                ActuatorRequestProtocol::V1,
+                libp2p_request_response::ProtocolSupport::Full,
+            )),
+            RequestResponseConfig::default(),
+        );
+
         gossipsub
             .subscribe(&IdentTopic::new("default"))
             .expect("Couldn't subscribe to topic");
 
         Ok(Self {
-            mdns,
-            peer_store,
-            gossipsub,
             ping,
+            mdns,
+            gossipsub,
+            actuator_requests,
+            local_peer_id,
+            out_ev: VecDeque::new(),
         })
+    }
+
+    pub async fn broadcast_identity(&mut self, peer_data: PeerData) {
+        //info!("Identity");
+        let topic = IdentTopic::new("default");
+        let message = bincode::serialize(&DiotdBroadcast::Identity(peer_data))
+            .expect("Failed to serialize config?!");
+        match self.gossipsub.publish(topic, message) {
+            Ok(id) => debug!("Sent identity msg with ID: {}", id),
+            Err(err) => match err {
+                PublishError::InsufficientPeers => {}
+                err => error!("Error while sending message: {:?}", err),
+            },
+        }
+    }
+
+    pub async fn broadcast_sensor_data(&mut self, sensor_data: FullSensorData) {
+        //info!("Sensor data: {:?}", sensor_data);
+        let topic = IdentTopic::new("default");
+        let message = bincode::serialize(&DiotdBroadcast::SensorData(sensor_data))
+            .expect("Failed to serialize config?!");
+        match self.gossipsub.publish(topic, message) {
+            Ok(id) => debug!("Sent sensor data msg with ID: {}", id),
+            Err(err) => match err {
+                PublishError::InsufficientPeers => {}
+                err => error!("Error while sending message: {:?}", err),
+            },
+        }
+    }
+
+    pub async fn send_actuator_request(
+        &mut self,
+        peer: &PeerId,
+        data: FullActuatorData,
+    ) -> RequestId {
+        self.actuator_requests.send_request(peer, data)
+    }
+
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+
+    fn push_broadcast_event(&mut self, sender: PeerId, broadcast: DiotdBroadcast) {
+        self.out_ev
+            .push_back(SwarmOutEvent::Broadcast(ReceivedBroadcast {
+                sender,
+                broadcast_type: broadcast,
+            }));
+    }
+
+    fn push_actuator_request_event(
+        &mut self,
+        data: FullActuatorData,
+        channel: ResponseChannel<RemoteActuationResponse>,
+    ) {
+        self.out_ev
+            .push_back(SwarmOutEvent::ActuatorRequest { data, channel });
+    }
+
+    fn push_actuator_response_event(&mut self, id: RequestId, response: ActuationResult) {
+        self.out_ev
+            .push_back(SwarmOutEvent::ActuatorResponse { id, response });
+    }
+
+    fn poll<TBehaviourIn>(
+        &mut self,
+        _: &mut TaskContext,
+        _: &mut impl PollParameters,
+    ) -> Poll<NetworkBehaviourAction<TBehaviourIn, SwarmOutEvent>> {
+        if let Some(ev) = self.out_ev.pop_front() {
+            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(ev));
+        }
+        Poll::Pending
     }
 }
 
@@ -90,6 +404,7 @@ impl NetworkBehaviourEventProcess<MdnsEvent> for DiotdBehavior {
             for (peer_id, multiaddr) in list {
                 debug!("Discovered peer {} with address {}", peer_id, multiaddr);
                 self.gossipsub.add_explicit_peer(&peer_id);
+                self.actuator_requests.add_address(&peer_id, multiaddr);
             }
         }
     }
@@ -119,15 +434,7 @@ impl NetworkBehaviourEventProcess<GossipsubEvent> for DiotdBehavior {
                         return;
                     }
                 };
-                match msg {
-                    DiotdBroadcast::Identity(peer_data) => {
-                        info!("Updating peer identity: {} --> {:?}", sender, peer_data);
-                        match self.peer_store.update_peer_data(&sender, &peer_data) {
-                            Ok(_) => {}
-                            Err(err) => error!("Error while updating peer identity: {}", err),
-                        };
-                    }
-                }
+                self.push_broadcast_event(sender, msg);
             }
             GossipsubEvent::Subscribed { peer_id, topic } => {
                 debug!("Peer {} subscribed to topic: {:?}", peer_id, topic);
@@ -146,9 +453,63 @@ impl NetworkBehaviourEventProcess<PingEvent> for DiotdBehavior {
     }
 }
 
+impl NetworkBehaviourEventProcess<RequestResponseEvent<FullActuatorData, RemoteActuationResponse>>
+    for DiotdBehavior
+{
+    #[instrument(skip(self, event))]
+    fn inject_event(
+        &mut self,
+        event: RequestResponseEvent<FullActuatorData, RemoteActuationResponse>,
+    ) {
+        match event {
+            RequestResponseEvent::Message { peer, message } => match message {
+                RequestResponseMessage::Request {
+                    request_id: _,
+                    request,
+                    channel,
+                } => {
+                    debug!("Received inbound request from peer {}", peer);
+                    self.push_actuator_request_event(request, channel);
+                }
+                RequestResponseMessage::Response {
+                    request_id,
+                    response,
+                } => {
+                    debug!("Received response to outbound request from peer {}", peer);
+                    self.push_actuator_response_event(request_id, response.into());
+                }
+            },
+            RequestResponseEvent::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                error!(
+                    "Outbound failure on Gossipsub, peer id = {}, request id = {}, err = {:?}",
+                    peer, request_id, error
+                );
+            }
+            RequestResponseEvent::InboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                error!(
+                    "Inbound failure on Gossipsub, peer id = {}, request id = {}, err = {:?}",
+                    peer, request_id, error
+                );
+            }
+            RequestResponseEvent::ResponseSent { peer, request_id } => {
+                debug!(
+                    "Sent response for request id {} from peer {}",
+                    request_id, peer
+                );
+            }
+        }
+    }
+}
+
 /// Sets up the appropiate encryption keypair for this node
-///
-/// TODO: read keypair from persistent storage
 #[instrument(skip(db))]
 fn setup_keypair(db: &sled::Db) -> Result<Keypair> {
     info!("Setting up keypair");
@@ -209,24 +570,24 @@ async fn setup_transport(keypair: Keypair, psk: PreSharedKey) -> Result<Transpor
         .boxed())
 }
 
-type DiodtSwarmIPH =
+type DiodtSwarmHandler =
     <<DiotdBehavior as NetworkBehaviour>::ProtocolsHandler as IntoProtocolsHandler>::Handler;
 pub type DiodtSwarm = ExpandedSwarm<
     DiotdBehavior,
-    <DiodtSwarmIPH as ProtocolsHandler>::InEvent,
-    <DiodtSwarmIPH as ProtocolsHandler>::OutEvent,
+    <DiodtSwarmHandler as ProtocolsHandler>::InEvent,
+    <DiodtSwarmHandler as ProtocolsHandler>::OutEvent,
     <DiotdBehavior as NetworkBehaviour>::ProtocolsHandler,
 >;
 
-pub async fn setup_swarm(db: &sled::Db, psk: PreSharedKey) -> Result<DiodtSwarm> {
-    let local_key = setup_keypair(db).context("Couldn't load local keypair")?;
+pub async fn setup_swarm(secrets: PeerSecrets) -> Result<DiodtSwarm> {
+    let local_key = Keypair::Ed25519(secrets.keypair);
     let local_peer_id = PeerId::from(local_key.public());
     info!("My peer ID is: {}", local_peer_id.to_base58());
-    let transport = setup_transport(local_key.clone(), psk)
+    let transport = setup_transport(local_key.clone(), secrets.psk)
         .await
         .context("Failed to create the transport")?;
     let swarm = {
-        let behavior = DiotdBehavior::new(local_peer_id, db, local_key)
+        let behavior = DiotdBehavior::new(local_peer_id, local_key)
             .await
             .context("Couldn't initialize the network behavior")?;
         SwarmBuilder::new(transport, behavior, local_peer_id)

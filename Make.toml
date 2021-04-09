@@ -1,0 +1,7 @@
+[tasks.check]
+command = "cross"
+args = ["check", "--target=arm-unknown-linux-gnueabi", "--message-format=json"]
+
+[tasks.check2]
+command = "cross"
+args = []

@@ -7,6 +7,13 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-bincode = "0.6"
+async-trait = "0.1"
+async-compat = "0.2"
+bs58 = "0.4"
+base64 = "0.13"
+base64-serde = "0.6"
+dashmap = { version = "4", features = ["serde"] }
 diot-core = { path = "../diot-core" }
 anyhow = "1.0"
 tokio-compat-02 = "0.2"
@@ -21,6 +28,9 @@ zerocopy = "0.3"
 byteorder = "1"
 lazy_static = "1"
 rand = "0.8"
+pin-project = "1"
+tokio-stream = { version = "0.1.5", features = ["sync"] }
+warp = "0.3"
 
 [dependencies.tokio]
 version = "1.0"
@@ -45,7 +55,6 @@ features = [
     "ping",
     "plaintext",
     "pnet",
-    "request-response",
     "secp256k1",
     "tcp-tokio",
     "uds",
@@ -54,3 +63,6 @@ features = [
 
 [dependencies.libp2p-mdns]
 path = "../vendor/libp2p-mdns"
+
+[dependencies.libp2p-request-response]
+path = "../vendor/libp2p-request-response"

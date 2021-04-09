@@ -71,7 +71,7 @@ pub fn decode_character_string(mut from: &[u8]) -> Result<Cow<'_, [u8]>, ()> {
 
 /// Builds the binary representation of a DNS query to send on the network.
 pub fn build_query(service_name: &[u8]) -> MdnsPacket {
-    let mut out = Vec::with_capacity(33);
+    let mut out = Vec::with_capacity(18 + service_name.len());
 
     // Program-generated transaction ID; unused by our implementation.
     append_u16(&mut out, rand::random());

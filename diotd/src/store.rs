@@ -1,86 +1,183 @@
-use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+use anyhow::Result;
+use dashmap::DashMap;
+use diot_core::device::{HardwareDeviceType, Measurement};
 use libp2p::PeerId;
-use sled::IVec;
+use serde::{Deserialize, Serialize};
 
-use crate::swarm::PeerData;
+use crate::{hardware::FullSensorData, swarm::PeerData, system::LocalPeerData};
 
-pub trait StoreSerializable {
-    fn serialize(&self, tree: sled::Tree) -> Result<()>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalPeerDevice {
+    pub device_type: HardwareDeviceType,
+    pub config: serde_json::Value,
 }
 
-const PEERDATA_PROPERTY_NAME: &str = "name";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePeerDevice {
+    pub device_type: HardwareDeviceType,
+}
 
-impl StoreSerializable for PeerData {
-    fn serialize(&self, tree: sled::Tree) -> Result<()> {
-        tree.insert(PEERDATA_PROPERTY_NAME, self.name.as_bytes())
-            .context("Failed to serialize peer name")?;
-
-        Ok(())
+impl From<LocalPeerDevice> for RemotePeerDevice {
+    fn from(dev: LocalPeerDevice) -> Self {
+        RemotePeerDevice {
+            device_type: dev.device_type,
+        }
     }
 }
 
-const TREE_PEERSTORE: &str = "peertrees";
-
-pub struct PeerStore {
-    db: sled::Db,
-    myself: PeerId,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SensorState {
+    pub current_value: Measurement,
 }
 
-impl PeerStore {
-    pub fn new(db: &sled::Db, myself: PeerId) -> Result<Self> {
-        Ok(Self {
-            db: db.clone(),
-            myself,
-        })
+impl SensorState {
+    pub fn new(current_value: Measurement) -> Self {
+        Self { current_value }
     }
+}
 
-    fn peer_tree(&self, peer: &PeerId) -> Result<sled::Tree> {
-        let peerlist = self
-            .db
-            .open_tree(TREE_PEERSTORE)
-            .context("Couldn't open peerlist tree")?;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub device_type: HardwareDeviceType,
+    pub sensors: HashMap<String, SensorState>,
+}
 
-        let key = peer.to_bytes();
+impl DeviceState {
+    pub fn from_device_type(device_type: HardwareDeviceType) -> Self {
+        Self {
+            device_type,
+            sensors: HashMap::default(),
+        }
+    }
+}
 
-        let tree_id = if let Some(tree_id) = peerlist
-            .get(&key)
-            .context("Couldn't get peer from peerlist")?
-        {
-            tree_id
-        } else {
-            info!("Opening store for peer {}", peer.to_base58());
-            let value = IVec::from(format!("peer-{}", peer.to_base58()).into_bytes());
-            peerlist
-                .insert(key, &value)
-                .context("Couldn't insert peerlist key")?;
-            value
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeerState {
+    pub name: String,
+    pub devices: HashMap<String, DeviceState>,
+}
+
+impl PeerState {
+    fn from_peer_data(data: PeerData) -> Self {
+        let mut devices = HashMap::with_capacity(data.devices.len());
+
+        for (device_name, RemotePeerDevice { device_type }) in data.devices {
+            devices.insert(device_name, DeviceState::from_device_type(device_type));
+        }
+
+        Self {
+            name: data.name,
+            devices,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct StoredPeerId {
+    peer_id: PeerId,
+}
+
+impl From<PeerId> for StoredPeerId {
+    fn from(peer_id: PeerId) -> Self {
+        Self { peer_id }
+    }
+}
+
+impl Serialize for StoredPeerId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = self.peer_id.to_base58();
+        serializer.serialize_str(&s)
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct FullSystemState {
+    pub peers: DashMap<StoredPeerId, PeerState>,
+}
+
+pub struct Storage {
+    local_peer_id: PeerId,
+    cache: FullSystemState,
+}
+
+impl Storage {
+    pub fn new(local_peer_id: PeerId, local_peer_data: LocalPeerData) -> Result<Self> {
+        let storage = Self {
+            local_peer_id,
+            cache: FullSystemState::default(),
         };
 
-        Ok(self
-            .db
-            .open_tree(tree_id)
-            .context("Couldn't open peer tree")?)
+        storage.insert_peer_data(storage.local_peer_id(), local_peer_data.into())?;
+
+        Ok(storage)
     }
 
-    pub fn update_peer_data(&self, peer: &PeerId, peer_data: &PeerData) -> Result<()> {
-        let peer_tree = self.peer_tree(peer)?;
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
 
-        peer_data
-            .serialize(peer_tree)
-            .context("Failed to serialize peer data")?;
+    pub fn peer_name(&self, peer: PeerId) -> Result<Option<String>> {
+        let peer = match self.cache.peers.get(&peer.into()) {
+            Some(peer) => peer,
+            None => return Ok(None),
+        };
+
+        Ok(Some(peer.name.clone()))
+    }
+
+    #[allow(dead_code)]
+    pub fn sensor_data(
+        &self,
+        peer: PeerId,
+        device_name: &str,
+        sensor_name: &str,
+    ) -> Result<Option<Measurement>> {
+        let peer = match self.cache.peers.get(&peer.into()) {
+            Some(peer) => peer,
+            None => return Ok(None),
+        };
+
+        Ok(peer
+            .devices
+            .get(device_name)
+            .and_then(|device_state| device_state.sensors.get(sensor_name))
+            .map(|sensor_state| sensor_state.current_value.clone()))
+    }
+
+    pub fn full_system_state(&self) -> &FullSystemState {
+        &self.cache
+    }
+
+    pub fn insert_peer_data(&self, peer: PeerId, peer_data: PeerData) -> Result<()> {
+        self.cache
+            .peers
+            .insert(peer.into(), PeerState::from_peer_data(peer_data));
 
         Ok(())
     }
 
-    pub fn peer_name(&self, peer: &PeerId) -> Result<Option<String>> {
-        let peer_tree = self.peer_tree(peer)?;
+    pub fn insert_sensor_data(
+        &self,
+        peer: PeerId,
+        sensor_data: FullSensorData,
+    ) -> Result<Option<()>> {
+        let mut peer = match self.cache.peers.get_mut(&peer.into()) {
+            Some(peer) => peer,
+            None => return Ok(None),
+        };
 
-        peer_tree
-            .get(PEERDATA_PROPERTY_NAME)
-            .context("Couldn't retrieve peer name")?
-            .map(|data| {
-                String::from_utf8(data.to_vec()).context("Stored peer name is invalid UTF-8")
-            })
-            .transpose()
+        Ok(peer
+            .devices
+            .get_mut(&sensor_data.device)
+            .map(|device_state| {
+                device_state
+                    .sensors
+                    .insert(sensor_data.sensor_name, SensorState::new(sensor_data.value));
+            }))
     }
 }

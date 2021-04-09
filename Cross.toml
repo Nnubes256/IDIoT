@@ -1,0 +1,2 @@
+[target.arm-unknown-linux-gnueabi]
+image = "idiot/cross:arm-unknown-linux-gnueabi-0.2.1"

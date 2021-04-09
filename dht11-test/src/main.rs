@@ -1,3 +1,4 @@
+#[cfg(arch = "arm")]
 use adafruit_dht11_sys::pi_2_dht_read;
 /*use hal_sensor_dht::SensorType;
 use libc::sched_param;
@@ -35,6 +36,15 @@ struct Measurement {
     humidity: f32,
 }
 
+#[cfg(not(target_arch = "arm"))]
+fn dht_read(_pin: i32) -> Result<Measurement, i32> {
+    Ok(Measurement {
+        temperature: 0.0,
+        humidity: 0.0,
+    })
+}
+
+#[cfg(target_arch = "arm")]
 fn dht_read(pin: i32) -> Result<Measurement, i32> {
     let mut temperature = 0.0;
     let mut humidity = 0.0;
