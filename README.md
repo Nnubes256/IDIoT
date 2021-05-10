@@ -58,7 +58,7 @@ Put in the working directory where the application will be run as `config.json`.
 
 **Note:** make sure to remove the comments before running!
 
-```json
+```javascript
 {
   // Peer data
   "peer": {
