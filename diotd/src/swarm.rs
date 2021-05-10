@@ -284,8 +284,9 @@ impl Debug for DiotdBehavior {
 }
 
 impl DiotdBehavior {
-    pub async fn new(local_peer_id: PeerId, keypair: Keypair) -> Result<Self> {
-        let mdns = Mdns::with_service_name(b"_p2p-nodes-nope._udp.local".to_vec())
+    pub async fn new(local_peer_id: PeerId, psk: PreSharedKey, keypair: Keypair) -> Result<Self> {
+        let service_name = format!("_p2p-{}._udp.local", psk.fingerprint().to_string());
+        let mdns = Mdns::with_service_name(service_name.as_bytes().to_vec())
             .await
             .context("Couldn't initialize mDNS")?;
 
@@ -587,7 +588,7 @@ pub async fn setup_swarm(secrets: PeerSecrets) -> Result<DiodtSwarm> {
         .await
         .context("Failed to create the transport")?;
     let swarm = {
-        let behavior = DiotdBehavior::new(local_peer_id, local_key)
+        let behavior = DiotdBehavior::new(local_peer_id, secrets.psk, local_key)
             .await
             .context("Couldn't initialize the network behavior")?;
         SwarmBuilder::new(transport, behavior, local_peer_id)
